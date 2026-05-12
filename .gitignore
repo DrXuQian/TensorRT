@@ -1,0 +1,5 @@
+build/
+__pycache__/
+*.pyc
+third_party/stablehlo/
+tools/experimental/trt-to-stablehlo/third_party/
