@@ -274,6 +274,31 @@ When padding (5) exceeds input size (3), we tile full copies via divmod:
 %2 = stablehlo.slice %1 [0:11]
 ```
 
+### kWRAP with pad > 3d (heavy tiling)
+
+`input=[0,1,2]`, `start=-10, size=15, stride=1` → `[2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1]`
+
+Padding (10) far exceeds input size (3). divmod: `10 = 3×3 + 1` → 3 full copies + 1-element remainder.
+
+```
+         rem(1)   full×3                 input    full×0  rem(2)
+           ↓    ┌────────────────────┐     ↓               ↓
+concat:   [2] ++ [0,1,2,0,1,2,0,1,2] ++ [0,1,2]        ++ [0,1]
+          └─── pad_lo=10 ───────────┘   original   └─ pad_hi=2 ─┘
+```
+
+**Lowered IR:**
+```mlir
+%0 = stablehlo.slice %arg0 [2:3]     // remainder [2]
+%1 = stablehlo.slice %arg0 [0:2]     // remainder [0,1]
+%2 = stablehlo.concatenate %0,       // [2]
+       %arg0, %arg0, %arg0,          // 3 full copies of [0,1,2]
+       %arg0,                         // original
+       %1, dim = 0                    // [0,1]
+// = [2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1]  (size=15)
+%3 = stablehlo.slice %2 [0:15]
+```
+
 ### kWRAP with negative stride
 
 `input=[0,1,2,3,4]`, `start=7, size=4, stride=-2` → `[2, 0, 3, 1]`
