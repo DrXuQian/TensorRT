@@ -71,7 +71,12 @@ public:
         // Mode-specific padding
         mlir::Value padded = input;
         switch (mode) {
-        case Mode::kSTRICT_BOUNDS: break;
+        case Mode::kSTRICT_BOUNDS:
+            for (int i = 0; i < rank; ++i) {
+                assert(pads[i].lo == 0 && pads[i].hi == 0 &&
+                       "kSTRICT_BOUNDS: slice goes out-of-bounds");
+            }
+            break;
         case Mode::kFILL:    padded = doPadFill(b, loc, input, fill, pads); break;
         case Mode::kCLAMP:   padded = doPadClamp(b, loc, input, pads); break;
         case Mode::kWRAP:    padded = doPadWrap(b, loc, input, pads); break;
