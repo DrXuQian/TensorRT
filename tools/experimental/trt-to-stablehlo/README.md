@@ -237,7 +237,131 @@ Value:     2   1 │ 0   1   2   3   4 │  3   2
 
 ---
 
-## Negative Stride Handling
+## Edge Cases: kWRAP and kREFLECT
+
+### kWRAP with stride > 1
+
+`input=[0,1,2,3,4]`, `start=-3, size=6, stride=2` → `[2, 4, 1, 3, 0, 2]`
+
+Every other element from a wrap-around view starting at index -3:
+
+```
+Wrapped view:  [2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2]
+                ↑     ↑     ↑     ↑     ↑     ↑     stride=2
+Result:        [2,    4,    1,    3,    0,    2]
+```
+
+**Lowered IR:**
+```mlir
+%0 = stablehlo.slice %arg0 [2:5]          // tail [2,3,4]
+%1 = stablehlo.slice %arg0 [0:3]          // head [0,1,2]
+%2 = stablehlo.concatenate %0, %arg0, %1  // [2,3,4,0,1,2,3,4,0,1,2]
+%3 = stablehlo.slice %2 [0:11:2]          // stride-2 pick → [2,4,1,3,0,2]
+```
+
+### kWRAP with pad > d (divmod tiling)
+
+`input=[0,1,2]`, `start=-5, size=11, stride=1` → `[1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]`
+
+When padding (5) exceeds input size (3), we tile full copies via divmod:
+`5 = 1*3 + 2` → 1 full copy + 2-element remainder.
+
+**Lowered IR:**
+```mlir
+%0 = stablehlo.slice %arg0 [1:3]                        // remainder [1,2]
+%1 = stablehlo.concatenate %0, %arg0, %arg0, %arg0      // [1,2] ++ [0,1,2] × 3
+// = [1,2,0,1,2,0,1,2,0,1,2]  (size=11)
+%2 = stablehlo.slice %1 [0:11]
+```
+
+### kWRAP with negative stride
+
+`input=[0,1,2,3,4]`, `start=7, size=4, stride=-2` → `[2, 0, 3, 1]`
+
+Accesses indices 7, 5, 3, 1 with wrap: `2, 0, 3, 1`.
+
+**Lowered IR:**
+```mlir
+%0 = stablehlo.slice %arg0 [0:3]          // head for hi-pad
+%1 = stablehlo.concatenate %arg0, %0      // [0,1,2,3,4,0,1,2]
+%2 = stablehlo.slice %1 [1:8:2]           // [1,3,0,2] (positive stride)
+%3 = stablehlo.reverse %2, dims = [0]     // [2,0,3,1]
+```
+
+---
+
+### kREFLECT with stride > 1
+
+`input=[0,1,2,3,4]`, `start=-3, size=5, stride=2` → `[3, 1, 1, 3, 3]`
+
+Every other element from a reflected view starting at index -3:
+
+```
+Reflected view: [3, 2, 1, 0, 1, 2, 3, 4, 3]
+                 ↑     ↑     ↑     ↑     ↑    stride=2
+Result:         [3,    1,    1,    3,    3]
+```
+
+**Lowered IR:**
+```mlir
+%0 = stablehlo.slice %arg0 [1:4]          // [1,2,3]
+%1 = stablehlo.reverse %0, dims = [0]     // [3,2,1]
+%2 = stablehlo.slice %arg0 [3:4]          // [3]
+%3 = stablehlo.reverse %2, dims = [0]     // [3]
+%4 = stablehlo.concatenate %1, %arg0, %3  // [3,2,1,0,1,2,3,4,3]
+%5 = stablehlo.slice %4 [0:9:2]           // [3,1,1,3,3]
+```
+
+### kREFLECT with pad > d-1 (multi-round)
+
+`input=[0,1,2]`, `start=-5, size=11, stride=1` → `[1, 0, 1, 2, 1, 0, 1, 2, 1, 0, 1]`
+
+Each reflect round can add at most `d-1=2` elements. Multiple rounds needed:
+
+```
+Round 1: [1,0] ++ [0,1,2] ++ [1,0]  →  [1,0,0,1,2,1,0]  (d=7)
+Round 2: [0,1,2,1,0,0] ++ [1,0,0,1,2,1,0] ++ [1]  →  [0,1,2,1,0,0,1,0,0,1,2,1,0,1] (not quite)
+...
+```
+
+The converter incrementally grows the tensor, each round reflecting `min(remaining, curD-1)` elements, until padding is satisfied.
+
+**Lowered IR (2 rounds):**
+```mlir
+// Round 1: reflect ±2 on d=3
+%0 = stablehlo.slice %arg0 [1:3]          // [1,2]
+%1 = stablehlo.reverse %0                 // [2,1]
+%2 = stablehlo.slice %arg0 [0:2]          // [0,1]
+%3 = stablehlo.reverse %2                 // [1,0]
+%4 = stablehlo.concatenate %1, %arg0, %3  // [2,1,0,1,2,1,0]  d=7
+
+// Round 2: reflect lo=3, hi=1 on d=7
+%5 = stablehlo.slice %4 [1:4]             // [1,0,1]
+%6 = stablehlo.reverse %5                 // [1,0,1]
+%7 = stablehlo.slice %4 [5:6]             // [1]
+%8 = stablehlo.reverse %7                 // [1]
+%9 = stablehlo.concatenate %6, %4, %8     // [1,0,1,2,1,0,1,2,1,0,1]  d=11
+%10 = stablehlo.slice %9 [0:11]
+```
+
+### kREFLECT with negative stride
+
+`input=[0,1,2,3,4]`, `start=6, size=3, stride=-2` → `[2, 4, 2]`
+
+Accesses indices 6, 4, 2 with reflect: `2, 4, 2`.
+
+**Lowered IR:**
+```mlir
+%0 = stablehlo.slice %arg0 [2:4]          // [2,3]
+%1 = stablehlo.reverse %0                 // [3,2]
+%2 = stablehlo.concatenate %arg0, %1      // [0,1,2,3,4,3,2]
+%3 = stablehlo.slice %2 [2:7:2]           // [2,4,2] (positive stride)
+%4 = stablehlo.reverse %3, dims = [0]     // [2,4,2]
+```
+
+---
+
+
 
 Negative strides are normalized before mode processing:
 
