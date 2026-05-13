@@ -6,6 +6,8 @@
 namespace trt {
 
 void populateTRTToStablehloPatterns(mlir::RewritePatternSet &patterns);
+void populateTRTDynToStablehloPatterns(mlir::RewritePatternSet &patterns);
+void registerFoldDynamicToStaticPass();
 
 #define GEN_PASS_DECL
 #include "TRT/Passes.h.inc"

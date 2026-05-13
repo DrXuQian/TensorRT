@@ -49,4 +49,25 @@ def TRT_SliceOp : TRT_Op<"slice", [Pure]> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// trt.dyn_slice op — dynamic start/size/stride
+//===----------------------------------------------------------------------===//
+
+def TRT_DynSliceOp : TRT_Op<"dyn_slice", [Pure]> {
+  let summary = "TensorRT-style slice with dynamic start/size/stride";
+  let arguments = (ins
+    AnyRankedTensor:$input,
+    1DTensorOf<[I64]>:$start,     // tensor<rank x i64>
+    1DTensorOf<[I64]>:$size,      // tensor<rank x i64>
+    1DTensorOf<[I64]>:$stride,    // tensor<rank x i64>
+    TRT_SampleModeAttr:$mode,
+    Optional<AnyRankedTensor>:$fill_value
+  );
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = [{
+    $input `,` $start `,` $size `,` $stride (`,` $fill_value^)? attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
 #endif // TRT_OPS

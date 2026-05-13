@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/Transforms/Passes.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 #include "TRT/TRTDialect.h"
@@ -9,6 +10,9 @@
 
 int main(int argc, char **argv) {
   trt::registerPasses();
+  trt::registerFoldDynamicToStaticPass();
+  mlir::registerCanonicalizerPass();
+  mlir::registerCSEPass();
 
   mlir::DialectRegistry registry;
   registry.insert<trt::TRTDialect, mlir::func::FuncDialect,

@@ -21,6 +21,7 @@ struct ConvertTRTToStablehloPass
 
     mlir::RewritePatternSet patterns(&getContext());
     populateTRTToStablehloPatterns(patterns);
+    populateTRTDynToStablehloPatterns(patterns);
 
     if (failed(mlir::applyPartialConversion(getOperation(), target,
                                             std::move(patterns))))
