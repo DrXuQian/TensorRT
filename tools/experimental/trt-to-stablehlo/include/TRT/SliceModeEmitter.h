@@ -206,33 +206,58 @@ private:
         return in;
     }
 
-    // ---- kREFLECT: reflection (handles pad > d-1 via multi-round) ----
+    // ---- helper: reverse along one axis ----
+    static mlir::Value reverseAxis(mlir::OpBuilder &b, mlir::Location loc,
+                                   mlir::Value v, int axis) {
+        return b.create<mlir::stablehlo::ReverseOp>(
+            loc, v.getType(), v, b.getDenseI64ArrayAttr({(int64_t)axis}));
+    }
+
+    // ---- kREFLECT: reflection via half-period chunks ----
     static mlir::Value doPadReflect(mlir::OpBuilder &b, mlir::Location loc,
                                     mlir::Value in, llvm::ArrayRef<Pad> pads) {
         int rank = mlir::cast<mlir::RankedTensorType>(in.getType()).getRank();
         for (int axis = 0; axis < rank; ++axis) {
             if (pads[axis].lo == 0 && pads[axis].hi == 0) continue;
-            int64_t needLo = pads[axis].lo, needHi = pads[axis].hi;
-            while (needLo > 0 || needHi > 0) {
-                int64_t curD = mlir::cast<mlir::RankedTensorType>(in.getType()).getDimSize(axis);
-                int64_t lo = std::min(needLo, curD - 1);
-                int64_t hi = std::min(needHi, curD - 1);
-                llvm::SmallVector<mlir::Value> parts;
-                if (lo > 0) {
-                    auto src = sliceAxis(b, loc, in, axis, 1, 1 + lo);
-                    parts.push_back(b.create<mlir::stablehlo::ReverseOp>(loc,
-                        src.getType(), src, b.getDenseI64ArrayAttr({(int64_t)axis})));
-                }
-                parts.push_back(in);
-                if (hi > 0) {
-                    auto src = sliceAxis(b, loc, in, axis, curD - 1 - hi, curD - 1);
-                    parts.push_back(b.create<mlir::stablehlo::ReverseOp>(loc,
-                        src.getType(), src, b.getDenseI64ArrayAttr({(int64_t)axis})));
-                }
-                in = concat(b, loc, parts, axis);
-                needLo -= lo;
-                needHi -= hi;
+            int64_t d = mlir::cast<mlir::RankedTensorType>(in.getType()).getDimSize(axis);
+            int64_t hp = d - 1;
+
+            auto fwdLo = sliceAxis(b, loc, in, axis, 0, hp);
+            auto fwdHi = sliceAxis(b, loc, in, axis, 1, d);
+            auto revLo = reverseAxis(b, loc, fwdLo, axis);
+            auto revHi = reverseAxis(b, loc, fwdHi, axis);
+
+            // Right: revLo, fwdHi, revLo, fwdHi, ...
+            llvm::SmallVector<mlir::Value> rightParts;
+            { int64_t rem = pads[axis].hi; int tog = 0;
+              while (rem > 0) {
+                auto chunk = (tog % 2 == 0) ? revLo : fwdHi;
+                int64_t take = std::min(rem, hp);
+                if (take < hp) chunk = sliceAxis(b, loc, chunk, axis, 0, take);
+                rightParts.push_back(chunk);
+                rem -= take; tog++;
+            }}
+
+            // Left (nearest-to-farthest): revHi, fwdLo, revHi, fwdLo, ...
+            llvm::SmallVector<mlir::Value> leftParts;
+            { llvm::SmallVector<mlir::Value> chunks;
+              int64_t rem = pads[axis].lo; int tog = 0;
+              while (rem > 0) {
+                auto chunk = (tog % 2 == 0) ? revHi : fwdLo;
+                int64_t take = std::min(rem, hp);
+                if (take < hp) chunk = sliceAxis(b, loc, chunk, axis, hp - take, hp);
+                chunks.push_back(chunk);
+                rem -= take; tog++;
+              }
+              for (auto it = chunks.rbegin(); it != chunks.rend(); ++it)
+                leftParts.push_back(*it);
             }
+
+            llvm::SmallVector<mlir::Value> parts;
+            parts.append(leftParts.begin(), leftParts.end());
+            parts.push_back(in);
+            parts.append(rightParts.begin(), rightParts.end());
+            in = concat(b, loc, parts, axis);
         }
         return in;
     }

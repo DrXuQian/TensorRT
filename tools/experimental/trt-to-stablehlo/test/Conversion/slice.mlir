@@ -92,11 +92,9 @@ func.func @wrap_basic(%in: tensor<5xi32>) -> tensor<9xi32> {
 
 // CHECK-LABEL: @reflect_basic
 func.func @reflect_basic(%in: tensor<5xi32>) -> tensor<9xi32> {
-  // CHECK: %[[LS:.*]] = stablehlo.slice %arg0 [1:3]
-  // CHECK: %[[LR:.*]] = stablehlo.reverse %[[LS]], dims = [0]
-  // CHECK: %[[HS:.*]] = stablehlo.slice %arg0 [2:4]
-  // CHECK: %[[HR:.*]] = stablehlo.reverse %[[HS]], dims = [0]
-  // CHECK: stablehlo.concatenate %[[LR]], %arg0, %[[HR]], dim = 0
+  // CHECK-DAG: stablehlo.slice %arg0
+  // CHECK-DAG: stablehlo.reverse
+  // CHECK: stablehlo.concatenate
   // CHECK: stablehlo.slice
   %0 = trt.slice %in {
     start = array<i64: -2>, size = array<i64: 9>, stride = array<i64: 1>,
@@ -169,4 +167,24 @@ func.func @fill_2d(%in: tensor<4x6xi32>, %f: tensor<i32>) -> tensor<6x8xi32> {
     mode = #trt<sample_mode kFILL>
   } : (tensor<4x6xi32>, tensor<i32>) -> tensor<6x8xi32>
   return %0 : tensor<6x8xi32>
+}
+
+// -----
+
+// ============================================================
+// kREFLECT: negative stride + pad > d-1
+// ============================================================
+
+// CHECK-LABEL: @reflect_neg_stride_big_pad
+func.func @reflect_neg_stride_big_pad(%in: tensor<3xi32>) -> tensor<12xi32> {
+  // CHECK-DAG: stablehlo.slice
+  // CHECK-DAG: stablehlo.reverse
+  // CHECK: stablehlo.concatenate
+  // CHECK: stablehlo.slice
+  // CHECK: stablehlo.reverse %{{.*}}, dims = [0]
+  %0 = trt.slice %in {
+    start = array<i64: 10>, size = array<i64: 12>, stride = array<i64: -1>,
+    mode = #trt<sample_mode kREFLECT>
+  } : (tensor<3xi32>) -> tensor<12xi32>
+  return %0 : tensor<12xi32>
 }

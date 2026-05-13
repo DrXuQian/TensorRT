@@ -5,8 +5,6 @@ set(LIBS
   MLIRFuncDialect
   MLIROptLib
   MLIRPass
-  MLIRRegisterAllDialects
-  MLIRRegisterAllPasses
 )
 
 add_llvm_executable(trt-opt trt-opt.cpp)

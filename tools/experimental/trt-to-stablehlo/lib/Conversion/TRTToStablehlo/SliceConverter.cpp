@@ -207,54 +207,95 @@ static Value padWrap(OpBuilder &b, Location loc, Value in,
   return in;
 }
 
-/// kREFLECT: per-axis reflection via slice + reverse + concatenate.
-/// Multi-round: each round can reflect at most (d-1) elements per side.
+/// Helper: reverse a Value along a single axis.
+static Value reverseAxis(OpBuilder &b, Location loc, Value v, int axis) {
+  return b.create<sh::ReverseOp>(
+      loc, v.getType(), v,
+      b.getDenseI64ArrayAttr(SmallVector<int64_t>{(int64_t)axis}));
+}
+
+/// Helper: concatenate parts along axis, computing result type.
+static Value concatParts(OpBuilder &b, Location loc,
+                         SmallVectorImpl<Value> &parts, int axis) {
+  auto ty0 = cast<RankedTensorType>(parts[0].getType());
+  SmallVector<int64_t> shape(ty0.getShape().begin(), ty0.getShape().end());
+  shape[axis] = 0;
+  for (auto p : parts)
+    shape[axis] += cast<RankedTensorType>(p.getType()).getDimSize(axis);
+  auto concatTy = RankedTensorType::get(shape, ty0.getElementType());
+  return b.create<sh::ConcatenateOp>(loc, concatTy, parts,
+                                     b.getI64IntegerAttr(axis));
+}
+
+/// kREFLECT: per-axis reflection via half-period chunks.
+///
+/// The reflect pattern has half-period hp = d-1. We build padding directly
+/// from the original tensor using alternating forward/reversed interior slices.
+///
+/// Right side chunks: revLo, fwdHi, revLo, fwdHi, ...
+///   where revLo = reverse(x[0:d-1]),  fwdHi = x[1:d]
+/// Left side chunks (nearest-to-farthest): revHi, fwdLo, revHi, fwdLo, ...
+///   where revHi = reverse(x[1:d]),  fwdLo = x[0:d-1]
 static Value padReflect(OpBuilder &b, Location loc, Value in,
                         ArrayRef<PadAmount> pads) {
   for (size_t axis = 0; axis < pads.size(); ++axis) {
     if (pads[axis].lo == 0 && pads[axis].hi == 0)
       continue;
-    int64_t needLo = pads[axis].lo;
-    int64_t needHi = pads[axis].hi;
+    auto inTy = cast<RankedTensorType>(in.getType());
+    int64_t d = inTy.getDimSize(axis);
+    int64_t hp = d - 1; // half-period
 
-    while (needLo > 0 || needHi > 0) {
-      auto curTy = cast<RankedTensorType>(in.getType());
-      int64_t curD = curTy.getDimSize(axis);
-      SmallVector<int64_t> shape(curTy.getShape().begin(),
-                                 curTy.getShape().end());
-      // Each round reflects at most curD-1 elements.
-      int64_t lo = std::min(needLo, curD - 1);
-      int64_t hi = std::min(needHi, curD - 1);
+    // Build the 4 base chunks from original tensor.
+    Value fwdLo = sliceAxis(b, loc, in, axis, 0, hp);    // x[0..d-2]
+    Value fwdHi = sliceAxis(b, loc, in, axis, 1, d);     // x[1..d-1]
+    Value revLo = reverseAxis(b, loc, fwdLo, axis);      // x[d-2..0]
+    Value revHi = reverseAxis(b, loc, fwdHi, axis);      // x[d-1..1]
 
-      SmallVector<Value> parts;
-      if (lo > 0) {
-        Value loSrc = sliceAxis(b, loc, in, axis, 1, 1 + lo);
-        Value loRev = b.create<sh::ReverseOp>(
-            loc, loSrc.getType(), loSrc,
-            b.getDenseI64ArrayAttr(SmallVector<int64_t>{(int64_t)axis}));
-        parts.push_back(loRev);
+    // Right padding: alternate revLo, fwdHi, revLo, fwdHi, ...
+    SmallVector<Value> rightParts;
+    {
+      int64_t rem = pads[axis].hi;
+      int toggle = 0;
+      while (rem > 0) {
+        Value chunk = (toggle % 2 == 0) ? revLo : fwdHi;
+        int64_t take = std::min(rem, hp);
+        if (take < hp)
+          chunk = sliceAxis(b, loc, chunk, axis, 0, take);
+        rightParts.push_back(chunk);
+        rem -= take;
+        toggle++;
       }
-      parts.push_back(in);
-      if (hi > 0) {
-        Value hiSrc = sliceAxis(b, loc, in, axis, curD - 1 - hi, curD - 1);
-        Value hiRev = b.create<sh::ReverseOp>(
-            loc, hiSrc.getType(), hiSrc,
-            b.getDenseI64ArrayAttr(SmallVector<int64_t>{(int64_t)axis}));
-        parts.push_back(hiRev);
-      }
-
-      int64_t newDim = 0;
-      for (auto part : parts)
-        newDim += cast<RankedTensorType>(part.getType()).getDimSize(axis);
-      SmallVector<int64_t> concatShape(shape);
-      concatShape[axis] = newDim;
-      auto concatTy =
-          RankedTensorType::get(concatShape, curTy.getElementType());
-      in = b.create<sh::ConcatenateOp>(loc, concatTy, parts,
-                                       b.getI64IntegerAttr(axis));
-      needLo -= lo;
-      needHi -= hi;
     }
+
+    // Left padding: alternate revHi, fwdLo (nearest-to-farthest),
+    // then reverse the list order for concatenation.
+    SmallVector<Value> leftParts;
+    {
+      SmallVector<Value> chunks; // nearest-to-farthest order
+      int64_t rem = pads[axis].lo;
+      int toggle = 0;
+      while (rem > 0) {
+        Value chunk = (toggle % 2 == 0) ? revHi : fwdLo;
+        int64_t take = std::min(rem, hp);
+        if (take < hp)
+          // Left partial: take the LAST `take` elements (farthest from original)
+          chunk = sliceAxis(b, loc, chunk, axis, hp - take, hp);
+        chunks.push_back(chunk);
+        rem -= take;
+        toggle++;
+      }
+      // Reverse order: farthest first → leftmost in output
+      for (auto it = chunks.rbegin(); it != chunks.rend(); ++it)
+        leftParts.push_back(*it);
+    }
+
+    // Assemble: left + original + right
+    SmallVector<Value> parts;
+    parts.append(leftParts.begin(), leftParts.end());
+    parts.push_back(in);
+    parts.append(rightParts.begin(), rightParts.end());
+
+    in = concatParts(b, loc, parts, axis);
   }
   return in;
 }
