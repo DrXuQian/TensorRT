@@ -188,3 +188,129 @@ func.func @reflect_neg_stride_big_pad(%in: tensor<3xi32>) -> tensor<12xi32> {
   } : (tensor<3xi32>) -> tensor<12xi32>
   return %0 : tensor<12xi32>
 }
+
+// -----
+
+// ============================================================
+// Hardcoded value tests: same input [10,20,30], all modes
+// ============================================================
+
+// CHECK-LABEL: @hc_clamp_right
+func.func @hc_clamp_right(%in: tensor<3xi32>) -> tensor<6xi32> {
+  // CHECK: stablehlo.concatenate
+  %0 = trt.slice %in {start = array<i64: 0>, size = array<i64: 6>,
+    stride = array<i64: 1>, mode = #trt<sample_mode kCLAMP>
+  } : (tensor<3xi32>) -> tensor<6xi32>
+  return %0 : tensor<6xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_clamp_left
+func.func @hc_clamp_left(%in: tensor<3xi32>) -> tensor<5xi32> {
+  // CHECK: stablehlo.concatenate
+  %0 = trt.slice %in {start = array<i64: -2>, size = array<i64: 5>,
+    stride = array<i64: 1>, mode = #trt<sample_mode kCLAMP>
+  } : (tensor<3xi32>) -> tensor<5xi32>
+  return %0 : tensor<5xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_clamp_neg_stride
+func.func @hc_clamp_neg_stride(%in: tensor<3xi32>) -> tensor<5xi32> {
+  // CHECK: stablehlo.reverse
+  %0 = trt.slice %in {start = array<i64: 4>, size = array<i64: 5>,
+    stride = array<i64: -1>, mode = #trt<sample_mode kCLAMP>
+  } : (tensor<3xi32>) -> tensor<5xi32>
+  return %0 : tensor<5xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_fill_right
+func.func @hc_fill_right(%in: tensor<3xi32>, %f: tensor<i32>) -> tensor<6xi32> {
+  // CHECK: stablehlo.pad
+  %0 = trt.slice %in, %f {start = array<i64: 0>, size = array<i64: 6>,
+    stride = array<i64: 1>, mode = #trt<sample_mode kFILL>
+  } : (tensor<3xi32>, tensor<i32>) -> tensor<6xi32>
+  return %0 : tensor<6xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_fill_neg_stride
+func.func @hc_fill_neg_stride(%in: tensor<3xi32>, %f: tensor<i32>) -> tensor<5xi32> {
+  // CHECK: stablehlo.pad
+  // CHECK: stablehlo.reverse
+  %0 = trt.slice %in, %f {start = array<i64: 4>, size = array<i64: 5>,
+    stride = array<i64: -1>, mode = #trt<sample_mode kFILL>
+  } : (tensor<3xi32>, tensor<i32>) -> tensor<5xi32>
+  return %0 : tensor<5xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_wrap_right
+func.func @hc_wrap_right(%in: tensor<3xi32>) -> tensor<7xi32> {
+  // CHECK: stablehlo.concatenate
+  %0 = trt.slice %in {start = array<i64: 0>, size = array<i64: 7>,
+    stride = array<i64: 1>, mode = #trt<sample_mode kWRAP>
+  } : (tensor<3xi32>) -> tensor<7xi32>
+  return %0 : tensor<7xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_wrap_big
+func.func @hc_wrap_big(%in: tensor<3xi32>) -> tensor<10xi32> {
+  // CHECK: stablehlo.concatenate
+  %0 = trt.slice %in {start = array<i64: 0>, size = array<i64: 10>,
+    stride = array<i64: 1>, mode = #trt<sample_mode kWRAP>
+  } : (tensor<3xi32>) -> tensor<10xi32>
+  return %0 : tensor<10xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_wrap_neg_stride
+func.func @hc_wrap_neg_stride(%in: tensor<3xi32>) -> tensor<6xi32> {
+  // CHECK: stablehlo.reverse
+  %0 = trt.slice %in {start = array<i64: 5>, size = array<i64: 6>,
+    stride = array<i64: -1>, mode = #trt<sample_mode kWRAP>
+  } : (tensor<3xi32>) -> tensor<6xi32>
+  return %0 : tensor<6xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_reflect_right_multi_period
+func.func @hc_reflect_right_multi_period(%in: tensor<3xi32>) -> tensor<8xi32> {
+  // CHECK: stablehlo.concatenate
+  %0 = trt.slice %in {start = array<i64: 0>, size = array<i64: 8>,
+    stride = array<i64: 1>, mode = #trt<sample_mode kREFLECT>
+  } : (tensor<3xi32>) -> tensor<8xi32>
+  return %0 : tensor<8xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_reflect_left
+func.func @hc_reflect_left(%in: tensor<3xi32>) -> tensor<5xi32> {
+  // CHECK: stablehlo.concatenate
+  %0 = trt.slice %in {start = array<i64: -2>, size = array<i64: 5>,
+    stride = array<i64: 1>, mode = #trt<sample_mode kREFLECT>
+  } : (tensor<3xi32>) -> tensor<5xi32>
+  return %0 : tensor<5xi32>
+}
+
+// -----
+
+// CHECK-LABEL: @hc_reflect_neg_stride
+func.func @hc_reflect_neg_stride(%in: tensor<3xi32>) -> tensor<5xi32> {
+  // CHECK: stablehlo.reverse
+  %0 = trt.slice %in {start = array<i64: 4>, size = array<i64: 5>,
+    stride = array<i64: -1>, mode = #trt<sample_mode kREFLECT>
+  } : (tensor<3xi32>) -> tensor<5xi32>
+  return %0 : tensor<5xi32>
+}
