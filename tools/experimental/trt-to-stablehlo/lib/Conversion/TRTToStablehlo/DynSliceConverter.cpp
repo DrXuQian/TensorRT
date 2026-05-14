@@ -1,11 +1,8 @@
 /// Dynamic trt.dyn_slice → StableHLO lowering via index computation + gather.
 ///
-/// For kCLAMP/kWRAP/kREFLECT/kSTRICT_BOUNDS:
-///   Per-axis: iota → raw_idx = start + iota*stride → mode-specific index
-///             mapping → gather along axis.
-///   No concat, no while, no pad. Negative strides handled naturally.
-///
-/// For kFILL: dynamic_pad + real_dynamic_slice (gather can't produce fill values).
+/// All 5 modes: per-axis iota → raw_idx = start + iota*stride → mode-specific
+/// index mapping → gather. Negative strides handled naturally.
+/// kFILL: gather with clamped indices + OOB mask + select with fill value.
 
 #include "TRT/Passes.h"
 #include "TRT/TRTDialect.h"
@@ -21,14 +18,6 @@ namespace {
 //===----------------------------------------------------------------------===//
 // Tiny helpers
 //===----------------------------------------------------------------------===//
-
-/// Scalar i64 constant (0-d tensor).
-static Value i64Scalar(OpBuilder &b, Location loc, int64_t v) {
-  return b.create<sh::ConstantOp>(
-      loc, DenseElementsAttr::get(
-               RankedTensorType::get({}, b.getI64Type()),
-               b.getI64IntegerAttr(v)));
-}
 
 /// Extract tensor<Nxi64>[idx] as tensor<i64> (scalar).
 static Value extractIdx(OpBuilder &b, Location loc, Value vec, int idx) {
@@ -60,6 +49,14 @@ static Value getDimBcast(OpBuilder &b, Location loc, Value input,
   return bcast(b, loc, d64, n);
 }
 
+/// Ensure a Value is a 0-d (scalar) tensor; reshape from 1-d if needed.
+static Value ensureScalar(OpBuilder &b, Location loc, Value v) {
+  auto ty = cast<RankedTensorType>(v.getType());
+  if (ty.getRank() == 0) return v;
+  return b.create<sh::ReshapeOp>(
+      loc, RankedTensorType::get({}, ty.getElementType()), v);
+}
+
 //===----------------------------------------------------------------------===//
 // Mode-specific index mapping (all operate on tensor<n x i64>)
 //===----------------------------------------------------------------------===//
@@ -70,28 +67,28 @@ static Value mapIndex(OpBuilder &b, Location loc, Value raw, Value d,
   auto ty = RankedTensorType::get({n}, b.getI64Type());
   Value zero = b.create<sh::ConstantOp>(loc, DenseElementsAttr::get(ty, b.getI64IntegerAttr(0)));
   Value one  = b.create<sh::ConstantOp>(loc, DenseElementsAttr::get(ty, b.getI64IntegerAttr(1)));
-  Value two  = b.create<sh::ConstantOp>(loc, DenseElementsAttr::get(ty, b.getI64IntegerAttr(2)));
   Value dm1  = b.create<sh::SubtractOp>(loc, d, one);
 
   switch (mode) {
   case trt::SampleMode::kSTRICT_BOUNDS:
+    // NOTE: no OOB check — gather with OOB indices is UB.
+    // Caller should verify inputs are in-bounds.
     return raw;
 
   case trt::SampleMode::kCLAMP:
     return b.create<sh::ClampOp>(loc, zero, raw, dm1);
 
   case trt::SampleMode::kWRAP: {
-    // ((raw % d) + d) % d  — handles negatives
+    // ((raw % d) + d) % d — handles negatives
     Value r = b.create<sh::RemOp>(loc, raw, d);
     return b.create<sh::RemOp>(loc, b.create<sh::AddOp>(loc, r, d), d);
   }
 
   case trt::SampleMode::kREFLECT: {
-    // p = 2*(d-1); c = ((|raw| % p) + p) % p; select(c>=d, p-c, c)
+    // p = 2*(d-1); c = |raw| % p; select(c >= d, p - c, c)
+    Value two = b.create<sh::ConstantOp>(loc, DenseElementsAttr::get(ty, b.getI64IntegerAttr(2)));
     Value p = b.create<sh::MulOp>(loc, dm1, two);
-    Value absRaw = b.create<sh::AbsOp>(loc, raw);
-    Value r = b.create<sh::RemOp>(loc, absRaw, p);
-    Value c = b.create<sh::RemOp>(loc, b.create<sh::AddOp>(loc, r, p), p);
+    Value c = b.create<sh::RemOp>(loc, b.create<sh::AbsOp>(loc, raw), p);
     Value cGeD = b.create<sh::CompareOp>(loc, c, d,
                      sh::ComparisonDirection::GE);
     return b.create<sh::SelectOp>(loc, cGeD,
@@ -99,9 +96,10 @@ static Value mapIndex(OpBuilder &b, Location loc, Value raw, Value d,
   }
 
   case trt::SampleMode::kFILL:
-    // gather with clamped indices; OOB mask applied in caller
+    // Gather with clamped indices; OOB mask applied in caller.
     return b.create<sh::ClampOp>(loc, zero, raw, dm1);
   }
+  llvm_unreachable("invalid SampleMode");
 }
 
 //===----------------------------------------------------------------------===//
@@ -157,6 +155,19 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
     auto inTy = cast<RankedTensorType>(adaptor.getInput().getType());
     int rank = inTy.getRank();
 
+    // rank=0: scalar, nothing to slice
+    if (rank == 0) {
+      rewriter.replaceOp(op, adaptor.getInput());
+      return success();
+    }
+
+    // Require static output dims (dynamic_iota needed otherwise)
+    for (int i = 0; i < rank; ++i) {
+      if (resultTy.getDimSize(i) == ShapedType::kDynamic)
+        return rewriter.notifyMatchFailure(op,
+            "dynamic output shape not yet supported");
+    }
+
     Value input = adaptor.getInput();
     bool isFill = (op.getMode() == trt::SampleMode::kFILL);
 
@@ -182,9 +193,8 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
       Value raw = rewriter.create<sh::AddOp>(loc, start,
                       rewriter.create<sh::MulOp>(loc, iota, stride));
 
-      // For kFILL: record which indices are OOB on this axis
+      // For kFILL: record which indices are in-bounds on this axis
       if (isFill) {
-        auto i64Ty = rewriter.getI64Type();
         Value zero = rewriter.create<sh::ConstantOp>(loc,
             DenseElementsAttr::get(iotaTy, rewriter.getI64IntegerAttr(0)));
         Value geLo = rewriter.create<sh::CompareOp>(loc, raw, zero,
@@ -201,12 +211,10 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
     // kFILL: replace OOB positions with fill value
     if (isFill) {
       // Combine per-axis masks: inBounds = mask0[i0] AND mask1[i1] AND ...
-      // Each mask is 1-D; broadcast to full output shape, then AND together.
       auto boolTy = RankedTensorType::get(resultTy.getShape(),
                                           rewriter.getI1Type());
       Value combinedMask;
       for (int axis = 0; axis < rank; ++axis) {
-        // Broadcast 1-D mask to full output shape along this axis
         SmallVector<int64_t> broadDims = {(int64_t)axis};
         Value mask = rewriter.create<sh::BroadcastInDimOp>(
             loc, boolTy, oobMasks[axis],
@@ -216,10 +224,10 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
             : mask;
       }
 
-      // Broadcast fill scalar to output shape
+      // Ensure fill_value is 0-d (may come as tensor<1xT> from TRT)
+      Value fv = ensureScalar(rewriter, loc, adaptor.getFillValue());
       Value fill = rewriter.create<sh::BroadcastInDimOp>(
-          loc, resultTy, adaptor.getFillValue(),
-          rewriter.getDenseI64ArrayAttr({}));
+          loc, resultTy, fv, rewriter.getDenseI64ArrayAttr({}));
 
       input = rewriter.create<sh::SelectOp>(loc, combinedMask, input, fill);
     }
@@ -227,8 +235,6 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
     rewriter.replaceOp(op, input);
     return success();
   }
-
-  // No private methods needed — all modes use the unified gather path.
 };
 
 } // namespace
