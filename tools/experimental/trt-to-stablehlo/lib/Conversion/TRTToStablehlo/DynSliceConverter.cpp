@@ -53,8 +53,10 @@ static Value getDimBcast(OpBuilder &b, Location loc, Value input,
 static Value ensureScalar(OpBuilder &b, Location loc, Value v) {
   auto ty = cast<RankedTensorType>(v.getType());
   if (ty.getRank() == 0) return v;
-  return b.create<sh::ReshapeOp>(
-      loc, RankedTensorType::get({}, ty.getElementType()), v);
+  auto scalarTy = RankedTensorType::get({}, ty.getElementType());
+  auto reshaped = b.create<sh::ReshapeOp>(loc, scalarTy, v);
+  assert(cast<RankedTensorType>(reshaped.getType()).getRank() == 0);
+  return reshaped;
 }
 
 //===----------------------------------------------------------------------===//
