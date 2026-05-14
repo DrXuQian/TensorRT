@@ -63,9 +63,16 @@ static Value ensureScalar(OpBuilder &b, Location loc, Value v) {
 // Mode-specific index mapping (all operate on tensor<n x i64>)
 //===----------------------------------------------------------------------===//
 
+/// Result of mapIndex: mapped indices + optional in-bounds mask (kFILL only).
+struct MappedIndex {
+  Value idx;
+  Value inBoundsMask; // null for non-FILL modes
+};
+
 /// Map raw indices to valid [0, d-1] range based on mode.
-static Value mapIndex(OpBuilder &b, Location loc, Value raw, Value d,
-                      trt::SampleMode mode, int64_t n) {
+/// For kFILL, also returns a per-element in-bounds mask.
+static MappedIndex mapIndex(OpBuilder &b, Location loc, Value raw, Value d,
+                            trt::SampleMode mode, int64_t n) {
   auto ty = RankedTensorType::get({n}, b.getI64Type());
   Value zero = b.create<sh::ConstantOp>(loc, DenseElementsAttr::get(ty, b.getI64IntegerAttr(0)));
   Value one  = b.create<sh::ConstantOp>(loc, DenseElementsAttr::get(ty, b.getI64IntegerAttr(1)));
@@ -74,32 +81,30 @@ static Value mapIndex(OpBuilder &b, Location loc, Value raw, Value d,
   switch (mode) {
   case trt::SampleMode::kSTRICT_BOUNDS:
     // NOTE: no OOB check — gather with OOB indices is UB.
-    // Caller should verify inputs are in-bounds.
-    return raw;
+    return {raw, {}};
 
   case trt::SampleMode::kCLAMP:
-    return b.create<sh::ClampOp>(loc, zero, raw, dm1);
+    return {b.create<sh::ClampOp>(loc, zero, raw, dm1), {}};
 
   case trt::SampleMode::kWRAP: {
-    // ((raw % d) + d) % d — handles negatives
     Value r = b.create<sh::RemOp>(loc, raw, d);
-    return b.create<sh::RemOp>(loc, b.create<sh::AddOp>(loc, r, d), d);
+    return {b.create<sh::RemOp>(loc, b.create<sh::AddOp>(loc, r, d), d), {}};
   }
 
   case trt::SampleMode::kREFLECT: {
-    // p = 2*(d-1); c = |raw| % p; select(c >= d, p - c, c)
     Value two = b.create<sh::ConstantOp>(loc, DenseElementsAttr::get(ty, b.getI64IntegerAttr(2)));
     Value p = b.create<sh::MulOp>(loc, dm1, two);
     Value c = b.create<sh::RemOp>(loc, b.create<sh::AbsOp>(loc, raw), p);
-    Value cGeD = b.create<sh::CompareOp>(loc, c, d,
-                     sh::ComparisonDirection::GE);
-    return b.create<sh::SelectOp>(loc, cGeD,
-               b.create<sh::SubtractOp>(loc, p, c), c);
+    Value cGeD = b.create<sh::CompareOp>(loc, c, d, sh::ComparisonDirection::GE);
+    return {b.create<sh::SelectOp>(loc, cGeD, b.create<sh::SubtractOp>(loc, p, c), c), {}};
   }
 
-  case trt::SampleMode::kFILL:
-    // Gather with clamped indices; OOB mask applied in caller.
-    return b.create<sh::ClampOp>(loc, zero, raw, dm1);
+  case trt::SampleMode::kFILL: {
+    Value geLo = b.create<sh::CompareOp>(loc, raw, zero, sh::ComparisonDirection::GE);
+    Value ltHi = b.create<sh::CompareOp>(loc, raw, d, sh::ComparisonDirection::LT);
+    Value mask = b.create<sh::AndOp>(loc, geLo, ltHi);
+    return {b.create<sh::ClampOp>(loc, zero, raw, dm1), mask};
+  }
   }
   llvm_unreachable("invalid SampleMode");
 }
@@ -171,12 +176,9 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
     }
 
     Value input = adaptor.getInput();
-    bool isFill = (op.getMode() == trt::SampleMode::kFILL);
+    SmallVector<Value> masks; // per-axis in-bounds masks (kFILL only)
 
-    // --- All modes: iota + mapIndex + gather (per-axis) ---
-    // For kFILL: also track per-axis OOB masks for final select.
-    SmallVector<Value> oobMasks; // per-axis: tensor<outDim[axis] x i1>
-
+    // --- Uniform loop: iota + mapIndex + gather, all modes ---
     for (int axis = 0; axis < rank; ++axis) {
       int64_t outDim = resultTy.getDimSize(axis);
 
@@ -188,50 +190,33 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
                            outDim);
       Value d = getDimBcast(rewriter, loc, adaptor.getInput(), axis, outDim);
 
-      // raw_idx = start + iota * stride
       auto iotaTy = RankedTensorType::get({outDim}, rewriter.getI64Type());
       Value iota = rewriter.create<sh::IotaOp>(loc, iotaTy,
                                                 rewriter.getI64IntegerAttr(0));
       Value raw = rewriter.create<sh::AddOp>(loc, start,
                       rewriter.create<sh::MulOp>(loc, iota, stride));
 
-      // For kFILL: record which indices are in-bounds on this axis
-      if (isFill) {
-        Value zero = rewriter.create<sh::ConstantOp>(loc,
-            DenseElementsAttr::get(iotaTy, rewriter.getI64IntegerAttr(0)));
-        Value geLo = rewriter.create<sh::CompareOp>(loc, raw, zero,
-                         sh::ComparisonDirection::GE);
-        Value ltHi = rewriter.create<sh::CompareOp>(loc, raw, d,
-                         sh::ComparisonDirection::LT);
-        oobMasks.push_back(rewriter.create<sh::AndOp>(loc, geLo, ltHi));
-      }
-
-      Value idx = mapIndex(rewriter, loc, raw, d, op.getMode(), outDim);
+      auto [idx, mask] = mapIndex(rewriter, loc, raw, d, op.getMode(), outDim);
+      if (mask) masks.push_back(mask);
       input = gatherAxis(rewriter, loc, input, idx, axis);
     }
 
-    // kFILL: replace OOB positions with fill value
-    if (isFill) {
-      // Combine per-axis masks: inBounds = mask0[i0] AND mask1[i1] AND ...
+    // Apply OOB mask if any mode produced one (currently kFILL only)
+    if (!masks.empty()) {
       auto boolTy = RankedTensorType::get(resultTy.getShape(),
                                           rewriter.getI1Type());
-      Value combinedMask;
-      for (int axis = 0; axis < rank; ++axis) {
-        SmallVector<int64_t> broadDims = {(int64_t)axis};
-        Value mask = rewriter.create<sh::BroadcastInDimOp>(
-            loc, boolTy, oobMasks[axis],
-            rewriter.getDenseI64ArrayAttr(broadDims));
-        combinedMask = combinedMask
-            ? rewriter.create<sh::AndOp>(loc, combinedMask, mask).getResult()
-            : mask;
+      Value combined;
+      for (int i = 0; i < (int)masks.size(); ++i) {
+        Value m = rewriter.create<sh::BroadcastInDimOp>(
+            loc, boolTy, masks[i],
+            rewriter.getDenseI64ArrayAttr({(int64_t)i}));
+        combined = combined
+            ? rewriter.create<sh::AndOp>(loc, combined, m).getResult() : m;
       }
-
-      // Ensure fill_value is 0-d (may come as tensor<1xT> from TRT)
       Value fv = ensureScalar(rewriter, loc, adaptor.getFillValue());
       Value fill = rewriter.create<sh::BroadcastInDimOp>(
           loc, resultTy, fv, rewriter.getDenseI64ArrayAttr({}));
-
-      input = rewriter.create<sh::SelectOp>(loc, combinedMask, input, fill);
+      input = rewriter.create<sh::SelectOp>(loc, combined, input, fill);
     }
 
     rewriter.replaceOp(op, input);
