@@ -77,8 +77,10 @@ func.func @dyn_reflect(%in: tensor<5xi32>,
 func.func @dyn_fill(%in: tensor<5xi32>,
     %s: tensor<1xi64>, %sz: tensor<1xi64>, %st: tensor<1xi64>,
     %f: tensor<i32>) -> tensor<9xi32> {
-  // CHECK: stablehlo.dynamic_pad
-  // CHECK: stablehlo.real_dynamic_slice
+  // CHECK: stablehlo.iota
+  // CHECK: stablehlo.clamp
+  // CHECK: stablehlo.gather
+  // CHECK: stablehlo.select
   %0 = trt.dyn_slice %in, %s, %sz, %st, %f {mode = #trt<sample_mode kFILL>}
     : (tensor<5xi32>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>, tensor<i32>) -> tensor<9xi32>
   return %0 : tensor<9xi32>

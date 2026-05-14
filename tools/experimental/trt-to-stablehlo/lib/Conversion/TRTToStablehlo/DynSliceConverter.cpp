@@ -98,8 +98,9 @@ static Value mapIndex(OpBuilder &b, Location loc, Value raw, Value d,
                b.create<sh::SubtractOp>(loc, p, c), c);
   }
 
-  default:
-    llvm_unreachable("kFILL handled separately");
+  case trt::SampleMode::kFILL:
+    // gather with clamped indices; OOB mask applied in caller
+    return b.create<sh::ClampOp>(loc, zero, raw, dm1);
   }
 }
 
@@ -157,16 +158,15 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
     int rank = inTy.getRank();
 
     Value input = adaptor.getInput();
+    bool isFill = (op.getMode() == trt::SampleMode::kFILL);
 
-    // --- kFILL: use dynamic_pad approach (gather can't synthesize fill) ---
-    if (op.getMode() == trt::SampleMode::kFILL)
-      return lowerFill(op, adaptor, rewriter);
+    // --- All modes: iota + mapIndex + gather (per-axis) ---
+    // For kFILL: also track per-axis OOB masks for final select.
+    SmallVector<Value> oobMasks; // per-axis: tensor<outDim[axis] x i1>
 
-    // --- kSTRICT/kCLAMP/kWRAP/kREFLECT: iota + mapIndex + gather ---
     for (int axis = 0; axis < rank; ++axis) {
       int64_t outDim = resultTy.getDimSize(axis);
 
-      // Extract start[axis], stride[axis] as scalars, broadcast to outDim
       Value start = bcast(rewriter, loc,
                           extractIdx(rewriter, loc, adaptor.getStart(), axis),
                           outDim);
@@ -182,104 +182,53 @@ struct DynSliceConverter : OpConversionPattern<trt::DynSliceOp> {
       Value raw = rewriter.create<sh::AddOp>(loc, start,
                       rewriter.create<sh::MulOp>(loc, iota, stride));
 
-      // Map to valid range
-      Value idx = mapIndex(rewriter, loc, raw, d, op.getMode(), outDim);
+      // For kFILL: record which indices are OOB on this axis
+      if (isFill) {
+        auto i64Ty = rewriter.getI64Type();
+        Value zero = rewriter.create<sh::ConstantOp>(loc,
+            DenseElementsAttr::get(iotaTy, rewriter.getI64IntegerAttr(0)));
+        Value geLo = rewriter.create<sh::CompareOp>(loc, raw, zero,
+                         sh::ComparisonDirection::GE);
+        Value ltHi = rewriter.create<sh::CompareOp>(loc, raw, d,
+                         sh::ComparisonDirection::LT);
+        oobMasks.push_back(rewriter.create<sh::AndOp>(loc, geLo, ltHi));
+      }
 
-      // Gather along this axis
+      Value idx = mapIndex(rewriter, loc, raw, d, op.getMode(), outDim);
       input = gatherAxis(rewriter, loc, input, idx, axis);
+    }
+
+    // kFILL: replace OOB positions with fill value
+    if (isFill) {
+      // Combine per-axis masks: inBounds = mask0[i0] AND mask1[i1] AND ...
+      // Each mask is 1-D; broadcast to full output shape, then AND together.
+      auto boolTy = RankedTensorType::get(resultTy.getShape(),
+                                          rewriter.getI1Type());
+      Value combinedMask;
+      for (int axis = 0; axis < rank; ++axis) {
+        // Broadcast 1-D mask to full output shape along this axis
+        SmallVector<int64_t> broadDims = {(int64_t)axis};
+        Value mask = rewriter.create<sh::BroadcastInDimOp>(
+            loc, boolTy, oobMasks[axis],
+            rewriter.getDenseI64ArrayAttr(broadDims));
+        combinedMask = combinedMask
+            ? rewriter.create<sh::AndOp>(loc, combinedMask, mask).getResult()
+            : mask;
+      }
+
+      // Broadcast fill scalar to output shape
+      Value fill = rewriter.create<sh::BroadcastInDimOp>(
+          loc, resultTy, adaptor.getFillValue(),
+          rewriter.getDenseI64ArrayAttr({}));
+
+      input = rewriter.create<sh::SelectOp>(loc, combinedMask, input, fill);
     }
 
     rewriter.replaceOp(op, input);
     return success();
   }
 
-private:
-  /// kFILL: compute pad amounts dynamically, use dynamic_pad + real_dynamic_slice.
-  LogicalResult lowerFill(trt::DynSliceOp op, OpAdaptor adaptor,
-                          ConversionPatternRewriter &rewriter) const {
-    auto loc = op.getLoc();
-    auto inTy = cast<RankedTensorType>(adaptor.getInput().getType());
-    int rank = inTy.getRank();
-    auto i64 = rewriter.getI64Type();
-    auto vecTy = RankedTensorType::get({rank}, i64);
-
-    Value start = adaptor.getStart();
-    Value size = adaptor.getSize();
-    Value stride = adaptor.getStride();
-
-    // Constants
-    Value zero = rewriter.create<sh::ConstantOp>(loc,
-        DenseElementsAttr::get(vecTy, rewriter.getI64IntegerAttr(0)));
-    Value one = rewriter.create<sh::ConstantOp>(loc,
-        DenseElementsAttr::get(vecTy, rewriter.getI64IntegerAttr(1)));
-
-    // Handle negative strides: normStart = select(stride<0, start+(size-1)*stride, start)
-    Value isNeg = rewriter.create<sh::CompareOp>(loc, stride, zero,
-                      sh::ComparisonDirection::LT);
-    Value sm1 = rewriter.create<sh::SubtractOp>(loc, size, one);
-    Value negAdj = rewriter.create<sh::AddOp>(loc, start,
-                       rewriter.create<sh::MulOp>(loc, sm1, stride));
-    Value normStart = rewriter.create<sh::SelectOp>(loc, isNeg, negAdj, start);
-    Value normStride = rewriter.create<sh::SelectOp>(loc, isNeg,
-                           rewriter.create<sh::NegOp>(loc, stride), stride);
-
-    // Pad amounts
-    Value padLo = rewriter.create<sh::MaxOp>(loc, zero,
-                      rewriter.create<sh::NegOp>(loc, normStart));
-    // dimSizes tensor
-    SmallVector<Value> dims;
-    for (int i = 0; i < rank; ++i) {
-      Value d32 = rewriter.create<sh::GetDimensionSizeOp>(loc,
-          RankedTensorType::get({}, rewriter.getI32Type()),
-          adaptor.getInput(), rewriter.getI64IntegerAttr(i));
-      Value d64 = rewriter.create<sh::ConvertOp>(loc,
-          RankedTensorType::get({}, i64), d32);
-      dims.push_back(rewriter.create<sh::ReshapeOp>(loc,
-          RankedTensorType::get({1}, i64), d64));
-    }
-    Value dimSizes = (rank == 1) ? dims[0]
-        : rewriter.create<sh::ConcatenateOp>(loc, vecTy, dims,
-              rewriter.getI64IntegerAttr(0)).getResult();
-
-    Value dm1 = rewriter.create<sh::SubtractOp>(loc, dimSizes, one);
-    Value offset = rewriter.create<sh::MulOp>(loc, sm1, normStride);
-    Value lastIdx = rewriter.create<sh::AddOp>(loc, normStart, offset);
-    Value padHi = rewriter.create<sh::MaxOp>(loc, zero,
-                      rewriter.create<sh::SubtractOp>(loc, lastIdx, dm1));
-
-    // dynamic_pad + real_dynamic_slice
-    Value padded = rewriter.create<sh::DynamicPadOp>(loc,
-        op.getResult().getType(), adaptor.getInput(), adaptor.getFillValue(),
-        padLo, padHi, zero);
-
-    Value newStart = rewriter.create<sh::AddOp>(loc, normStart, padLo);
-    Value newLimit = rewriter.create<sh::AddOp>(loc, newStart,
-                         rewriter.create<sh::AddOp>(loc, offset, one));
-    Value result = rewriter.create<sh::RealDynamicSliceOp>(loc,
-        op.getResult().getType(), padded, newStart, newLimit, normStride);
-
-    // Reverse for negative strides (per-dim select)
-    for (int i = 0; i < rank; ++i) {
-      Value rev = rewriter.create<sh::ReverseOp>(loc, result.getType(), result,
-                      rewriter.getDenseI64ArrayAttr({(int64_t)i}));
-      auto i1Ty = rewriter.getI1Type();
-      Value flag = rewriter.create<sh::SliceOp>(loc,
-          RankedTensorType::get({1}, i1Ty), isNeg,
-          rewriter.getDenseI64ArrayAttr({(int64_t)i}),
-          rewriter.getDenseI64ArrayAttr({(int64_t)(i + 1)}),
-          rewriter.getDenseI64ArrayAttr({1}));
-      Value flagScalar = rewriter.create<sh::ReshapeOp>(loc,
-          RankedTensorType::get({}, i1Ty), flag);
-      Value mask = rewriter.create<sh::BroadcastInDimOp>(loc,
-          RankedTensorType::get(
-              cast<RankedTensorType>(result.getType()).getShape(), i1Ty),
-          flagScalar, rewriter.getDenseI64ArrayAttr({}));
-      result = rewriter.create<sh::SelectOp>(loc, mask, rev, result);
-    }
-
-    rewriter.replaceOp(op, result);
-    return success();
-  }
+  // No private methods needed — all modes use the unified gather path.
 };
 
 } // namespace
